@@ -90,6 +90,7 @@ fn classify_finding(rule_id: &str) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub fn build_analysis_prompt(finding: &Finding, context: &str) -> String {
     let category_guidance = classify_finding(&finding.rule_id);
 
@@ -126,6 +127,7 @@ Respond with ONLY a JSON object."#,
     )
 }
 
+#[allow(dead_code)]
 fn truncate_context(context: &str, max_chars: usize) -> String {
     if context.len() <= max_chars {
         return context.to_string();

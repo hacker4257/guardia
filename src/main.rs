@@ -50,7 +50,7 @@ fn main() -> Result<()> {
             let duration = start.elapsed();
 
             let ai_annotations = if ai_flag && !findings.is_empty() {
-                run_ai_analysis(
+                run_agent_analysis(
                     &mut findings,
                     &ai_provider,
                     &ai_model,
@@ -93,7 +93,7 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-fn run_ai_analysis(
+fn run_agent_analysis(
     findings: &mut Vec<scanner::Finding>,
     provider: &str,
     model: &str,
@@ -114,7 +114,7 @@ fn run_ai_analysis(
     }
 
     eprintln!(
-        "  {} Analyzing {} findings with AI ({} / {})...",
+        "  {} Analyzing {} findings with AI Agent pipeline ({} / {})...",
         "🤖".to_string(),
         findings.len(),
         config.provider_name(),
@@ -131,22 +131,55 @@ fn run_ai_analysis(
     }
 
     let rt = tokio::runtime::Runtime::new()?;
-    let analyses = rt.block_on(ai::analyze_findings(findings, &config, &file_contents))?;
+    let results = rt.block_on(
+        ai::orchestrator::run_agent_pipeline(findings, &config, &file_contents)
+    )?;
 
-    let fp_count = ai::apply_ai_filter(findings, &analyses);
+    let mut fp_count = 0;
+    let mut annotations = HashMap::new();
+    let false_positive_indices: std::collections::HashSet<usize> = results.iter()
+        .filter(|(_, a, _)| a.is_false_positive && a.confidence > 0.7)
+        .map(|(idx, _, _)| { fp_count += 1; *idx })
+        .collect();
+
     if fp_count > 0 {
         eprintln!(
-            "  {} AI filtered {} false positive(s)",
+            "  {} AI agents filtered {} false positive(s)",
             "✓".green(),
             fp_count,
         );
     }
 
-    let annotations = ai::build_ai_annotations(findings, &analyses);
+    let mut idx = 0;
+    findings.retain(|_| {
+        let keep = !false_positive_indices.contains(&idx);
+        idx += 1;
+        keep
+    });
+
+    for (original_idx, analysis, vuln_ctx) in &results {
+        if !false_positive_indices.contains(original_idx) {
+            let agent_count = vuln_ctx.agent_trace.len();
+            let mut enriched = analysis.clone();
+            if agent_count > 1 {
+                let trace_summary: String = vuln_ctx.agent_trace.iter()
+                    .map(|s| format!("[{}]", s.agent))
+                    .collect::<Vec<_>>()
+                    .join(" → ");
+                enriched.reasoning = format!(
+                    "{} (agents: {})",
+                    enriched.reasoning,
+                    trace_summary,
+                );
+            }
+            annotations.insert(*original_idx, enriched);
+        }
+    }
+
     let annotated = annotations.len();
     if annotated > 0 {
         eprintln!(
-            "  {} AI annotated {} finding(s) with reasoning & fixes",
+            "  {} AI agents annotated {} finding(s) with deep analysis",
             "✓".green(),
             annotated,
         );

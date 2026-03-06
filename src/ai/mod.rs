@@ -1,15 +1,11 @@
+pub mod agents;
+mod agent_prompts;
+pub mod orchestrator;
 mod prompt;
 
 use anyhow::Result;
-use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
-
-use crate::scanner::Finding;
 
 #[derive(Debug, Clone)]
 pub struct AiConfig {
@@ -81,71 +77,7 @@ pub struct AiAnalysis {
     pub suggested_fix: Option<String>,
 }
 
-pub async fn analyze_findings(
-    findings: &[Finding],
-    config: &AiConfig,
-    file_contents: &HashMap<PathBuf, String>,
-) -> Result<Vec<(usize, AiAnalysis)>> {
-    let client = reqwest::Client::builder()
-        .timeout(config.timeout)
-        .build()?;
-
-    let semaphore = Arc::new(Semaphore::new(config.max_concurrency));
-    let client = Arc::new(client);
-    let config = Arc::new(config.clone());
-
-    let pb = ProgressBar::new(findings.len() as u64);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("  {spinner:.green} AI analyzing [{bar:30.green/dim}] {pos}/{len} {msg}")
-            .unwrap()
-            .progress_chars("━╸─"),
-    );
-
-    let mut handles = Vec::new();
-
-    for (idx, finding) in findings.iter().enumerate() {
-        let context = file_contents
-            .get(&finding.file_path)
-            .map(|c| extract_context(c, finding.line_number, 5))
-            .unwrap_or_default();
-
-        let user_prompt = prompt::build_analysis_prompt(finding, &context);
-        let sem = semaphore.clone();
-        let cli = client.clone();
-        let cfg = config.clone();
-        let pb = pb.clone();
-        let title = finding.title.clone();
-
-        let handle = tokio::spawn(async move {
-            let _permit = sem.acquire().await.unwrap();
-            pb.set_message(format!("#{} {}", idx + 1, title));
-
-            let result = call_with_retry(&cli, &cfg, &user_prompt).await;
-            pb.inc(1);
-
-            match result {
-                Ok(text) => Some((idx, parse_ai_response(&text))),
-                Err(_) => None,
-            }
-        });
-
-        handles.push(handle);
-    }
-
-    let mut results = Vec::new();
-    for handle in handles {
-        if let Ok(Some(result)) = handle.await {
-            results.push(result);
-        }
-    }
-
-    pb.finish_and_clear();
-    results.sort_by_key(|(idx, _)| *idx);
-    Ok(results)
-}
-
-async fn call_with_retry(
+pub(crate) async fn call_with_retry(
     client: &reqwest::Client,
     config: &AiConfig,
     prompt: &str,
@@ -171,53 +103,6 @@ async fn call_with_retry(
     }
 
     Err(last_err)
-}
-
-pub fn apply_ai_filter(
-    findings: &mut Vec<Finding>,
-    analyses: &[(usize, AiAnalysis)],
-) -> usize {
-    let false_positive_indices: std::collections::HashSet<usize> = analyses
-        .iter()
-        .filter(|(_, a)| a.is_false_positive && a.confidence > 0.7)
-        .map(|(idx, _)| *idx)
-        .collect();
-
-    let count = false_positive_indices.len();
-
-    let mut idx = 0;
-    findings.retain(|_| {
-        let keep = !false_positive_indices.contains(&idx);
-        idx += 1;
-        keep
-    });
-
-    count
-}
-
-pub fn build_ai_annotations(
-    _findings: &[Finding],
-    analyses: &[(usize, AiAnalysis)],
-) -> HashMap<usize, AiAnalysis> {
-    let mut map = HashMap::new();
-    for (idx, analysis) in analyses {
-        if !analysis.is_false_positive {
-            map.insert(*idx, analysis.clone());
-        }
-    }
-    map
-}
-
-fn extract_context(content: &str, line: usize, radius: usize) -> String {
-    let lines: Vec<&str> = content.lines().collect();
-    let start = line.saturating_sub(radius + 1);
-    let end = (line + radius).min(lines.len());
-    lines[start..end]
-        .iter()
-        .enumerate()
-        .map(|(i, l)| format!("{:>4} | {}", start + i + 1, l))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 // ── Ollama ──
@@ -373,7 +258,7 @@ struct RawJsonResponse {
     fix_description: Option<String>,
 }
 
-fn parse_ai_response(text: &str) -> AiAnalysis {
+pub(crate) fn parse_ai_response(text: &str) -> AiAnalysis {
     if let Some(analysis) = try_parse_json(text) {
         return analysis;
     }
@@ -396,7 +281,7 @@ fn try_parse_json(text: &str) -> Option<AiAnalysis> {
     })
 }
 
-fn extract_json_object(text: &str) -> Option<String> {
+pub(crate) fn extract_json_object(text: &str) -> Option<String> {
     let start = text.find('{')?;
     let mut depth = 0;
     let mut in_string = false;
