@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::scanner::Finding;
 use super::agents::*;
 

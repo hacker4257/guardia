@@ -2,6 +2,8 @@ pub mod agents;
 mod agent_prompts;
 pub mod orchestrator;
 mod prompt;
+pub mod react;
+pub mod tools;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
