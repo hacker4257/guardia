@@ -1,0 +1,8 @@
+# .env file with secrets - should be detected by guardia
+
+DB_PASSWORD=super_secret_password_123
+DATABASE_URL=postgres://user:pass@localhost:5432/db
+SECRET_KEY=my-very-secret-key-that-should-not-be-here
+AUTH_TOKEN=ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghij
+ACCESS_TOKEN=sk-ant-api03-abcdefghijklmnopqrstuvwxyz1234567890ABCDEFGHIJ
+ENCRYPTION_KEY=aes-256-key-that-is-definitely-a-real-secret
