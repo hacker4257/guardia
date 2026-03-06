@@ -1,8 +1,12 @@
 pub mod agents;
 mod agent_prompts;
+pub mod evidence;
+pub mod judge;
 pub mod orchestrator;
 mod prompt;
+#[allow(dead_code)]
 pub mod react;
+pub mod specialist_agents;
 pub mod tools;
 
 use anyhow::Result;

@@ -24,6 +24,7 @@ impl ToolBox {
         Self { file_contents }
     }
 
+    #[allow(dead_code)]
     pub fn available_tools() -> &'static str {
         r#"You have access to these tools. Call them by responding with a JSON object with "tool" and "args" fields.
 
