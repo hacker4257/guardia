@@ -65,6 +65,30 @@ pub enum Commands {
         #[arg(long, default_value = "30")]
         ai_timeout: u64,
 
+        /// Privacy mode: local-only, sanitized, unrestricted
+        #[arg(long, default_value = "sanitized")]
+        privacy: String,
+
+        /// Path for privacy audit log
+        #[arg(long, default_value = "guardia-audit.jsonl")]
+        audit_log: String,
+
+        /// Path to local CWE/CVE knowledge database (JSON)
+        #[arg(long)]
+        cve_db: Option<String>,
+
+        /// Enable PoC sandbox verification (requires Docker)
+        #[arg(long)]
+        verify: bool,
+
+        /// Sandbox verification timeout in seconds
+        #[arg(long, default_value = "30")]
+        verify_timeout: u64,
+
+        /// Skip symbolic verification
+        #[arg(long)]
+        no_verify: bool,
+
         /// Launch interactive TUI dashboard
         #[arg(long)]
         tui: bool,

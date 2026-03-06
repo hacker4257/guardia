@@ -30,6 +30,12 @@ fn main() -> Result<()> {
             ai_url,
             ai_concurrency,
             ai_timeout,
+            privacy,
+            audit_log,
+            cve_db,
+            verify,
+            verify_timeout,
+            no_verify,
             tui: tui_flag,
         } => {
             let start = Instant::now();
@@ -49,6 +55,12 @@ fn main() -> Result<()> {
             let mut findings = scanner::run_scan(&config)?;
             let duration = start.elapsed();
 
+            let privacy_config = {
+                let mut pc = ai::privacy::PrivacyConfig::from_mode_str(&privacy);
+                pc.audit_log_path = Some(std::path::PathBuf::from(&audit_log));
+                pc
+            };
+
             let ai_annotations = if ai_flag && !findings.is_empty() {
                 run_agent_analysis(
                     &mut findings,
@@ -57,6 +69,11 @@ fn main() -> Result<()> {
                     ai_url.as_deref(),
                     ai_timeout,
                     ai_concurrency,
+                    &privacy_config,
+                    cve_db.as_deref(),
+                    verify,
+                    verify_timeout,
+                    no_verify,
                 )?
             } else {
                 HashMap::new()
@@ -100,6 +117,11 @@ fn run_agent_analysis(
     custom_url: Option<&str>,
     timeout_secs: u64,
     concurrency: usize,
+    privacy_config: &ai::privacy::PrivacyConfig,
+    cve_db_path: Option<&str>,
+    verify_flag: bool,
+    verify_timeout: u64,
+    no_verify: bool,
 ) -> Result<HashMap<usize, ai::AiAnalysis>> {
     let config = ai::AiConfig::new(provider, model, custom_url, timeout_secs, concurrency);
 
@@ -113,12 +135,20 @@ fn run_agent_analysis(
         return Ok(HashMap::new());
     }
 
+    ai::privacy::check_privacy_gate(&config.provider, privacy_config)?;
+
     eprintln!(
         "  {} Analyzing {} findings with AI Agent pipeline ({} / {})...",
         "🤖".to_string(),
         findings.len(),
         config.provider_name(),
         model,
+    );
+    eprintln!(
+        "  {} Privacy: {:?} | Verify: {}",
+        "🔒".to_string(),
+        privacy_config.mode,
+        if no_verify { "disabled" } else if verify_flag { "sandbox+symbolic" } else { "symbolic-only" },
     );
 
     let mut file_contents = HashMap::new();
@@ -130,10 +160,59 @@ fn run_agent_analysis(
         }
     }
 
+    let _knowledge_base = ai::knowledge::KnowledgeBase::new(cve_db_path);
+
     let rt = tokio::runtime::Runtime::new()?;
     let results = rt.block_on(
         ai::orchestrator::run_agent_pipeline(findings, &config, &file_contents)
     )?;
+
+    let mut verification_results: HashMap<usize, ai::verify::VerificationStatus> = HashMap::new();
+    if !no_verify {
+        for (idx, analysis, vuln_ctx) in &results {
+            let finding_ref = findings.get(*idx);
+            let symbolic = ai::verify::symbolic::run_symbolic_verification(
+                finding_ref,
+                vuln_ctx,
+                &file_contents,
+            );
+            let sandbox = if verify_flag
+                && analysis.confidence > 0.7
+                && !analysis.is_false_positive
+                && symbolic.reachable
+            {
+                if let Some(finding) = finding_ref {
+                    if matches!(finding.severity, scanner::Severity::Critical | scanner::Severity::High) {
+                        rt.block_on(ai::verify::sandbox::run_sandbox_verification(
+                            finding,
+                            vuln_ctx,
+                            &config,
+                            &reqwest::Client::new(),
+                            verify_timeout,
+                        )).ok()
+                    } else { None }
+                } else { None }
+            } else { None };
+
+            verification_results.insert(*idx, ai::verify::VerificationStatus {
+                symbolic: symbolic.clone(),
+                sandbox,
+            });
+        }
+    }
+
+    if !verification_results.is_empty() {
+        let verified_count = verification_results.values()
+            .filter(|v| v.sandbox.as_ref().map(|s| matches!(s.status, ai::verify::sandbox::VerifyStatus::Verified)).unwrap_or(false))
+            .count();
+        let symbolic_count = verification_results.len();
+        eprintln!(
+            "  {} Symbolic verification: {} findings | Sandbox verified: {}",
+            "🔍".to_string(),
+            symbolic_count,
+            verified_count,
+        );
+    }
 
     let mut fp_count = 0;
     let mut annotations = HashMap::new();
@@ -161,6 +240,17 @@ fn run_agent_analysis(
         if !false_positive_indices.contains(original_idx) {
             let agent_count = vuln_ctx.agent_trace.len();
             let mut enriched = analysis.clone();
+
+            if let Some(vstatus) = verification_results.get(original_idx) {
+                let adj = vstatus.confidence_adjustment();
+                enriched.confidence = (enriched.confidence + adj).clamp(0.0, 1.0);
+                enriched.reasoning = format!(
+                    "{} | Verification: {}",
+                    enriched.reasoning,
+                    vstatus.summary(),
+                );
+            }
+
             if agent_count > 1 {
                 let trace_summary: String = vuln_ctx.agent_trace.iter()
                     .map(|s| format!("[{}]", s.agent))

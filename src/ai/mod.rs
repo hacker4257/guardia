@@ -1,13 +1,19 @@
 pub mod agents;
 mod agent_prompts;
+pub mod context_window;
 pub mod evidence;
 pub mod judge;
+#[allow(dead_code)]
+pub mod knowledge;
+pub mod memory;
 pub mod orchestrator;
+pub mod privacy;
 mod prompt;
 #[allow(dead_code)]
 pub mod react;
 pub mod specialist_agents;
 pub mod tools;
+pub mod verify;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -88,6 +94,32 @@ pub(crate) async fn call_with_retry(
     config: &AiConfig,
     prompt: &str,
 ) -> Result<String> {
+    call_with_retry_privacy(client, config, prompt, None).await
+}
+
+pub(crate) async fn call_with_retry_privacy(
+    client: &reqwest::Client,
+    config: &AiConfig,
+    prompt: &str,
+    privacy_config: Option<&privacy::PrivacyConfig>,
+) -> Result<String> {
+    if let Some(pc) = privacy_config {
+        privacy::check_privacy_gate(&config.provider, pc)?;
+    }
+
+    let effective_prompt = match privacy_config {
+        Some(pc) => privacy::prepare_prompt(prompt, pc, &config.provider),
+        None => prompt.to_string(),
+    };
+
+    let sanitized = privacy_config.is_some()
+        && matches!(privacy_config.unwrap().mode, privacy::PrivacyMode::SanitizedRemote)
+        && matches!(config.provider, AiProvider::OpenAI | AiProvider::Anthropic);
+
+    if let Some(pc) = privacy_config {
+        privacy::write_audit_log(pc, config.provider_name(), &effective_prompt, sanitized);
+    }
+
     let mut last_err = anyhow::anyhow!("no attempts made");
 
     for attempt in 0..=config.max_retries {
@@ -96,9 +128,9 @@ pub(crate) async fn call_with_retry(
         }
 
         let result = match &config.provider {
-            AiProvider::Ollama => call_ollama(client, config, prompt).await,
-            AiProvider::OpenAI => call_openai(client, config, prompt).await,
-            AiProvider::Anthropic => call_anthropic(client, config, prompt).await,
+            AiProvider::Ollama => call_ollama(client, config, &effective_prompt).await,
+            AiProvider::OpenAI => call_openai(client, config, &effective_prompt).await,
+            AiProvider::Anthropic => call_anthropic(client, config, &effective_prompt).await,
         };
 
         match result {
@@ -254,6 +286,7 @@ async fn call_anthropic(client: &reqwest::Client, config: &AiConfig, prompt: &st
 
 // ── Response parsing ──
 
+#[allow(dead_code)]
 #[derive(Deserialize)]
 struct RawJsonResponse {
     false_positive: Option<bool>,
@@ -264,6 +297,7 @@ struct RawJsonResponse {
     fix_description: Option<String>,
 }
 
+#[allow(dead_code)]
 pub(crate) fn parse_ai_response(text: &str) -> AiAnalysis {
     if let Some(analysis) = try_parse_json(text) {
         return analysis;
@@ -271,6 +305,7 @@ pub(crate) fn parse_ai_response(text: &str) -> AiAnalysis {
     parse_text_fallback(text)
 }
 
+#[allow(dead_code)]
 fn try_parse_json(text: &str) -> Option<AiAnalysis> {
     let json_str = extract_json_object(text)?;
     let raw: RawJsonResponse = serde_json::from_str(&json_str).ok()?;
@@ -314,6 +349,7 @@ pub(crate) fn extract_json_object(text: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn parse_text_fallback(text: &str) -> AiAnalysis {
     let lower = text.to_lowercase();
 
@@ -357,6 +393,7 @@ fn parse_text_fallback(text: &str) -> AiAnalysis {
     }
 }
 
+#[allow(dead_code)]
 fn extract_confidence_number(text: &str) -> Option<f32> {
     let patterns = ["confidence: ", "confidence\":", "\"confidence\":"];
     for pat in &patterns {
@@ -373,6 +410,7 @@ fn extract_confidence_number(text: &str) -> Option<f32> {
     None
 }
 
+#[allow(dead_code)]
 fn extract_field(text: &str, field: &str) -> Option<String> {
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix(field) {
@@ -385,6 +423,7 @@ fn extract_field(text: &str, field: &str) -> Option<String> {
     None
 }
 
+#[allow(dead_code)]
 fn extract_code_block(text: &str) -> Option<String> {
     let start = text.find("```")?;
     let after = &text[start + 3..];

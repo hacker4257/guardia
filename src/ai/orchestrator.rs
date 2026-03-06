@@ -6,10 +6,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 
 use crate::scanner::Finding;
-use super::agents::{VulnContext, AgentStep, AnalysisStrategy};
+use super::agents::{VulnContext, AgentStep, AnalysisStrategy, gather_static_context};
 use super::evidence::EvidenceBoard;
 use super::judge;
-use super::react::ProjectMemory;
+use super::memory::{ProjectMemory, FindingCache, FindingConclusion};
 use super::specialist_agents;
 use super::{AiConfig, AiAnalysis};
 
@@ -26,7 +26,8 @@ pub async fn run_agent_pipeline(
     let llm_semaphore = Arc::new(Semaphore::new(config.max_concurrency * 3));
     let client = Arc::new(client);
     let config = Arc::new(config.clone());
-    let memory = Arc::new(Mutex::new(ProjectMemory::default()));
+    let memory = ProjectMemory::new_shared();
+    let cache = Arc::new(Mutex::new(FindingCache::new()));
 
     let multi_pb = MultiProgress::new();
     let main_pb = multi_pb.add(ProgressBar::new(findings.len() as u64));
@@ -46,6 +47,7 @@ pub async fn run_agent_pipeline(
         let cfg = config.clone();
         let pb = main_pb.clone();
         let mem = memory.clone();
+        let fc = cache.clone();
         let finding = finding.clone();
         let file_contents = file_contents.clone();
         let multi = multi_pb.clone();
@@ -55,7 +57,7 @@ pub async fn run_agent_pipeline(
             pb.set_message(format!("#{} {}", idx + 1, &finding.title[..finding.title.len().min(30)]));
 
             let result = analyze_single_finding(
-                idx, &finding, &cfg, &cli, &file_contents, mem, l_sem, &multi,
+                idx, &finding, &cfg, &cli, &file_contents, mem, fc, l_sem, &multi,
             ).await;
 
             pb.inc(1);
@@ -84,9 +86,39 @@ async fn analyze_single_finding(
     client: &reqwest::Client,
     file_contents: &HashMap<PathBuf, String>,
     memory: Arc<Mutex<ProjectMemory>>,
+    cache: Arc<Mutex<FindingCache>>,
     llm_semaphore: Arc<Semaphore>,
     _multi: &MultiProgress,
 ) -> (usize, AiAnalysis, VulnContext) {
+    let file_ctx = gather_static_context(finding, file_contents);
+    let func_name = file_ctx.function_signature
+        .split('(').next().unwrap_or("")
+        .split_whitespace().last().unwrap_or("")
+        .to_string();
+    let file_path_str = finding.file_path.to_string_lossy().to_string();
+
+    // Check cache first
+    if let Some(cached) = cache.lock().unwrap().lookup(&finding.rule_id, &file_path_str, &func_name) {
+        let mut vuln_ctx = VulnContext::default();
+        vuln_ctx.agent_trace.push(AgentStep {
+            agent: "cache".into(),
+            action: "cache_hit".into(),
+            result_summary: format!("fp={} conf={:.2}: {}", cached.is_false_positive, cached.confidence,
+                cached.reasoning.chars().take(100).collect::<String>()),
+        });
+        return (idx, AiAnalysis {
+            is_false_positive: cached.is_false_positive,
+            confidence: cached.confidence,
+            reasoning: cached.reasoning,
+            suggested_fix: cached.suggested_fix,
+        }, vuln_ctx);
+    }
+
+    // Recall relevant context from memory
+    let recalled = memory.lock().unwrap().recall_for_finding(
+        &finding.rule_id, &file_path_str, &func_name,
+    );
+
     let board = EvidenceBoard::new_shared();
     let strategy = AnalysisStrategy::from_rule_id(&finding.rule_id);
     let roles = strategy.required_agents();
@@ -102,6 +134,7 @@ async fn analyze_single_finding(
         let memory = memory.clone();
         let sem = llm_semaphore.clone();
         let role = *role;
+        let recalled = recalled.clone();
 
         let handle = tokio::spawn(async move {
             let _permit = sem.acquire().await.unwrap();
@@ -109,17 +142,17 @@ async fn analyze_single_finding(
             let result = match role {
                 super::agents::AgentRole::ContextGatherer => {
                     specialist_agents::run_context_agent(
-                        &finding, &config, &client, &file_contents, board, memory,
+                        &finding, &config, &client, &file_contents, board, memory, &recalled,
                     ).await
                 }
                 super::agents::AgentRole::DataflowTracer => {
                     specialist_agents::run_dataflow_agent(
-                        &finding, &config, &client, &file_contents, board, memory,
+                        &finding, &config, &client, &file_contents, board, memory, &recalled,
                     ).await
                 }
                 super::agents::AgentRole::ExploitValidator => {
                     specialist_agents::run_exploit_agent(
-                        &finding, &config, &client, &file_contents, board, memory,
+                        &finding, &config, &client, &file_contents, board, memory, &recalled,
                     ).await
                 }
                 super::agents::AgentRole::Synthesizer => {
@@ -149,6 +182,23 @@ async fn analyze_single_finding(
         },
     };
 
+    // Store in cache and memory
+    cache.lock().unwrap().store(
+        &finding.rule_id, &file_path_str, &func_name,
+        analysis.is_false_positive, analysis.confidence,
+        &analysis.reasoning, analysis.suggested_fix.clone(),
+    );
+
+    memory.lock().unwrap().record_conclusion(FindingConclusion {
+        rule_id: finding.rule_id.clone(),
+        file_path: file_path_str,
+        function_name: func_name,
+        is_false_positive: analysis.is_false_positive,
+        confidence: analysis.confidence,
+        key_reason: analysis.reasoning.chars().take(150).collect(),
+        file_hash: 0,
+    });
+
     let board_data = board.lock().unwrap();
     let mut vuln_ctx = VulnContext::default();
 
@@ -168,6 +218,13 @@ async fn analyze_single_finding(
                 verdict.is_false_positive, verdict.confidence,
                 verdict.reasoning.chars().take(100).collect::<String>(),
             ),
+        });
+    }
+    if board_data.has_critical_conflicts() {
+        vuln_ctx.agent_trace.push(AgentStep {
+            agent: "orchestrator".into(),
+            action: "conflict_detected".into(),
+            result_summary: format!("{} conflicts found", board_data.conflicts.len()),
         });
     }
     vuln_ctx.agent_trace.push(AgentStep {

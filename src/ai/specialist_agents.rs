@@ -1,16 +1,17 @@
 use anyhow::Result;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 
 use crate::scanner::Finding;
-use super::evidence::{SharedBoard, Evidence, EvidenceCategory, AgentVerdict};
+use super::context_window::ContextWindow;
+use super::evidence::{SharedBoard, Evidence, EvidenceCategory, EvidenceSource, AgentVerdict};
+use super::memory::{SharedMemory, RecalledContext};
 use super::tools::{ToolBox, ToolCall};
 use super::agents::{FileContext, DataflowTrace, gather_static_context, trace_static_dataflow};
-use super::react::ProjectMemory;
 use super::{AiConfig, call_with_retry, extract_json_object};
 
 const AGENT_MAX_STEPS: usize = 5;
+const AGENT_TOKEN_BUDGET: usize = 3000;
 
 // ── Context Agent ──
 // Gathers file-level context: language, test file, imports, function scope, callers
@@ -21,7 +22,8 @@ pub async fn run_context_agent(
     client: &reqwest::Client,
     file_contents: &HashMap<PathBuf, String>,
     board: SharedBoard,
-    memory: Arc<Mutex<ProjectMemory>>,
+    memory: SharedMemory,
+    recalled: &RecalledContext,
 ) -> Result<()> {
     let toolbox = ToolBox::new(file_contents.clone());
     let file_ctx = gather_static_context(finding, file_contents);
@@ -36,6 +38,8 @@ pub async fn run_context_agent(
             if file_ctx.callers.is_empty() { "none".to_string() } else { file_ctx.callers.join(", ") },
         ),
         confidence: 0.95,
+        source_type: EvidenceSource::StaticAnalysis,
+        timestamp_ms: 0,
     });
 
     if file_ctx.is_test_file && finding.rule_id.starts_with("SEC") {
@@ -49,8 +53,6 @@ pub async fn run_context_agent(
         return Ok(());
     }
 
-    let mem_snapshot = memory.lock().unwrap().summary();
-
     let prompt = format!(
         r#"You are a Context Analysis Agent investigating a security finding.
 Your ONLY job: understand the code context around this finding. Do NOT judge if it's a real vulnerability.
@@ -63,8 +65,8 @@ Matched: {matched}
 ## Already Known
 {static_ctx}
 
-## Project Knowledge
-{memory}
+## Memory
+{recalled}
 
 ## Your Tools
 - read_file: Read file content. Args: {{"path": "...", "start_line": "...", "end_line": "..."}}
@@ -79,7 +81,7 @@ Gather context then call done. Respond with JSON: {{"tool": "...", "args": {{...
         line = finding.line_number,
         matched = &finding.matched_text[..finding.matched_text.len().min(80)],
         static_ctx = format_file_context(&file_ctx),
-        memory = mem_snapshot,
+        recalled = recalled.format_for_prompt(),
     );
 
     run_agent_loop("context", &prompt, &toolbox, config, client, board, memory, |args, board| {
@@ -93,6 +95,8 @@ Gather context then call done. Respond with JSON: {{"tool": "...", "args": {{...
             category: EvidenceCategory::CallerAnalysis,
             content: format!("Reachable: {}. {}", is_reachable, summary),
             confidence: 0.8,
+            source_type: EvidenceSource::LlmReasoning,
+            timestamp_ms: 0,
         });
 
         if let Some(fw) = args.get("framework_detected") {
@@ -102,6 +106,8 @@ Gather context then call done. Respond with JSON: {{"tool": "...", "args": {{...
                     category: EvidenceCategory::CodePattern,
                     content: format!("Framework: {}", fw),
                     confidence: 0.85,
+                    source_type: EvidenceSource::LlmReasoning,
+                    timestamp_ms: 0,
                 });
             }
         }
@@ -117,7 +123,8 @@ pub async fn run_dataflow_agent(
     client: &reqwest::Client,
     file_contents: &HashMap<PathBuf, String>,
     board: SharedBoard,
-    memory: Arc<Mutex<ProjectMemory>>,
+    memory: SharedMemory,
+    recalled: &RecalledContext,
 ) -> Result<()> {
     let toolbox = ToolBox::new(file_contents.clone());
     let file_ctx = gather_static_context(finding, file_contents);
@@ -128,6 +135,8 @@ pub async fn run_dataflow_agent(
         category: EvidenceCategory::DataflowPath,
         content: format_dataflow_static(&dataflow),
         confidence: 0.7,
+        source_type: EvidenceSource::StaticAnalysis,
+        timestamp_ms: 0,
     });
 
     if finding.rule_id.starts_with("SEC") {
@@ -141,8 +150,6 @@ pub async fn run_dataflow_agent(
         return Ok(());
     }
 
-    let mem_snapshot = memory.lock().unwrap().summary();
-
     let prompt = format!(
         r#"You are a Dataflow Tracing Agent investigating a security finding.
 Your ONLY job: trace data flow from user input to dangerous operations. Do NOT make a final vulnerability judgment.
@@ -155,15 +162,15 @@ Description: {desc}
 ## Static Dataflow (pre-computed)
 {static_df}
 
-## Project Knowledge
-{memory}
+## Memory
+{recalled}
 
 ## Your Tools
 - read_file: Read file content. Args: {{"path": "...", "start_line": "...", "end_line": "..."}}
 - search_code: Search across files. Args: {{"pattern": "..."}}
 - check_sanitization: Check if variable is sanitized. Args: {{"path": "...", "variable": "...", "from_line": "...", "to_line": "..."}}
 - find_function: Find function definition. Args: {{"function_name": "..."}}
-- done: Report findings. Args: {{"taint_path": "source → ... → sink", "is_sanitized": "true/false", "sanitizer_details": "...", "dataflow_confidence": "0.0-1.0"}}
+- done: Report findings. Args: {{"taint_path": "source -> ... -> sink", "is_sanitized": "true/false", "sanitizer_details": "...", "dataflow_confidence": "0.0-1.0"}}
 
 Trace the data flow then call done. Respond with JSON: {{"tool": "...", "args": {{...}}}}"#,
         rule_id = finding.rule_id,
@@ -172,7 +179,7 @@ Trace the data flow then call done. Respond with JSON: {{"tool": "...", "args": 
         line = finding.line_number,
         desc = &finding.description[..finding.description.len().min(200)],
         static_df = format_dataflow_static(&dataflow),
-        memory = mem_snapshot,
+        recalled = recalled.format_for_prompt(),
     );
 
     run_agent_loop("dataflow", &prompt, &toolbox, config, client, board, memory, |args, board| {
@@ -189,6 +196,8 @@ Trace the data flow then call done. Respond with JSON: {{"tool": "...", "args": 
             category: EvidenceCategory::SanitizationCheck,
             content: format!("Sanitized: {}. Path: {}", is_sanitized, taint_path),
             confidence,
+            source_type: EvidenceSource::LlmReasoning,
+            timestamp_ms: 0,
         });
 
         if is_sanitized {
@@ -198,6 +207,8 @@ Trace the data flow then call done. Respond with JSON: {{"tool": "...", "args": 
                     category: EvidenceCategory::SanitizationCheck,
                     content: format!("Sanitizer: {}", details),
                     confidence,
+                    source_type: EvidenceSource::ToolOutput,
+                    timestamp_ms: 0,
                 });
             }
         }
@@ -213,7 +224,8 @@ pub async fn run_exploit_agent(
     client: &reqwest::Client,
     file_contents: &HashMap<PathBuf, String>,
     board: SharedBoard,
-    memory: Arc<Mutex<ProjectMemory>>,
+    memory: SharedMemory,
+    recalled: &RecalledContext,
 ) -> Result<()> {
     let toolbox = ToolBox::new(file_contents.clone());
 
@@ -223,11 +235,11 @@ pub async fn run_exploit_agent(
             category: EvidenceCategory::ExploitAssessment,
             content: "Secret finding — exploit assessment: check if secret is real and exposed".into(),
             confidence: 0.6,
+            source_type: EvidenceSource::StaticAnalysis,
+            timestamp_ms: 0,
         });
         return Ok(());
     }
-
-    let mem_snapshot = memory.lock().unwrap().summary();
 
     let prompt = format!(
         r#"You are an Exploit Assessment Agent investigating a security finding.
@@ -239,8 +251,8 @@ Severity: {severity}
 File: {file}:{line}
 Description: {desc}
 
-## Project Knowledge
-{memory}
+## Memory
+{recalled}
 
 ## Your Tools
 - read_file: Read file content. Args: {{"path": "...", "start_line": "...", "end_line": "..."}}
@@ -256,7 +268,7 @@ Assess exploitability then call done. Respond with JSON: {{"tool": "...", "args"
         file = finding.file_path.display(),
         line = finding.line_number,
         desc = &finding.description[..finding.description.len().min(200)],
-        memory = mem_snapshot,
+        recalled = recalled.format_for_prompt(),
     );
 
     run_agent_loop("exploit", &prompt, &toolbox, config, client, board, memory, |args, board| {
@@ -279,6 +291,8 @@ Assess exploitability then call done. Respond with JSON: {{"tool": "...", "args"
             category: EvidenceCategory::ExploitAssessment,
             content,
             confidence: if is_exploitable { 0.8 } else { 0.7 },
+            source_type: EvidenceSource::LlmReasoning,
+            timestamp_ms: 0,
         });
 
         if is_exploitable {
@@ -302,22 +316,23 @@ async fn run_agent_loop<F>(
     config: &AiConfig,
     client: &reqwest::Client,
     board: SharedBoard,
-    memory: Arc<Mutex<ProjectMemory>>,
+    memory: SharedMemory,
     on_done: F,
 ) -> Result<()>
 where
     F: FnOnce(&HashMap<String, String>, &SharedBoard),
 {
-    let mut conversation = vec![initial_prompt.to_string()];
+    let mut ctx_window = ContextWindow::new(AGENT_TOKEN_BUDGET, initial_prompt.to_string());
 
     for _step in 0..AGENT_MAX_STEPS {
-        let prompt_text = conversation.join("\n\n");
+        let prompt_text = ctx_window.render();
         let response = call_with_retry(client, config, &prompt_text).await
             .unwrap_or_else(|_| format!(
                 r#"{{"tool": "done", "args": {{"error": "LLM call failed for {} agent"}}}}"#,
                 agent_name
             ));
 
+        ctx_window.add_assistant(response.clone());
         memory.lock().unwrap().learn_from_response(&response);
 
         if let Some(json_str) = extract_json_object(&response) {
@@ -328,20 +343,12 @@ where
                 }
 
                 let result = toolbox.execute(&call);
-                conversation.push(format!(
-                    "[Tool Result: {}]\n{}",
-                    call.tool,
-                    if result.output.len() > 1500 {
-                        format!("{}...(truncated)", &result.output[..1500])
-                    } else {
-                        result.output
-                    }
-                ));
+                ctx_window.add_tool_result(&call.tool, result.output);
                 continue;
             }
         }
 
-        conversation.push("Continue. Use a tool or call done with your findings. Respond with JSON.".into());
+        ctx_window.add_nudge("Continue. Use a tool or call done with your findings. Respond with JSON.".into());
     }
 
     on_done(&HashMap::new(), &board);
