@@ -10,6 +10,7 @@ use anyhow::Result;
 use clap::Parser;
 use cli::{Cli, Commands, OutputFormat};
 use colored::Colorize;
+use std::collections::HashMap;
 use std::time::Instant;
 
 fn main() -> Result<()> {
@@ -26,6 +27,9 @@ fn main() -> Result<()> {
             ai: ai_flag,
             ai_provider,
             ai_model,
+            ai_url,
+            ai_concurrency,
+            ai_timeout,
             tui: tui_flag,
         } => {
             let start = Instant::now();
@@ -45,17 +49,26 @@ fn main() -> Result<()> {
             let mut findings = scanner::run_scan(&config)?;
             let duration = start.elapsed();
 
-            if ai_flag && !findings.is_empty() {
-                run_ai_analysis(&mut findings, &ai_provider, &ai_model, &path)?;
-            }
+            let ai_annotations = if ai_flag && !findings.is_empty() {
+                run_ai_analysis(
+                    &mut findings,
+                    &ai_provider,
+                    &ai_model,
+                    ai_url.as_deref(),
+                    ai_timeout,
+                    ai_concurrency,
+                )?
+            } else {
+                HashMap::new()
+            };
 
             if tui_flag {
                 tui::run_tui(findings, duration)?;
             } else {
                 match format {
-                    OutputFormat::Text => report::terminal::print_report(&findings, duration),
-                    OutputFormat::Json => report::json::print_report(&findings)?,
-                    OutputFormat::Sarif => report::sarif::print_report(&findings)?,
+                    OutputFormat::Text => report::terminal::print_report(&findings, duration, &ai_annotations),
+                    OutputFormat::Json => report::json::print_report(&findings, &ai_annotations)?,
+                    OutputFormat::Sarif => report::sarif::print_report(&findings, &ai_annotations)?,
                 }
 
                 if findings.iter().any(|f| {
@@ -84,38 +97,31 @@ fn run_ai_analysis(
     findings: &mut Vec<scanner::Finding>,
     provider: &str,
     model: &str,
-    _scan_path: &std::path::Path,
-) -> Result<()> {
-    let ai_config = match provider {
-        "openai" => {
-            let key = std::env::var("OPENAI_API_KEY")
-                .unwrap_or_else(|_| {
-                    eprintln!("  {} Set OPENAI_API_KEY environment variable", "⚠".yellow());
-                    String::new()
-                });
-            if key.is_empty() { return Ok(()); }
-            ai::AiConfig::openai(model, &key)
-        }
-        "anthropic" | "claude" => {
-            let key = std::env::var("ANTHROPIC_API_KEY")
-                .unwrap_or_else(|_| {
-                    eprintln!("  {} Set ANTHROPIC_API_KEY environment variable", "⚠".yellow());
-                    String::new()
-                });
-            if key.is_empty() { return Ok(()); }
-            ai::AiConfig::anthropic(model, &key)
-        }
-        _ => ai::AiConfig::ollama(model),
-    };
+    custom_url: Option<&str>,
+    timeout_secs: u64,
+    concurrency: usize,
+) -> Result<HashMap<usize, ai::AiAnalysis>> {
+    let config = ai::AiConfig::new(provider, model, custom_url, timeout_secs, concurrency);
+
+    if config.missing_api_key() {
+        eprintln!(
+            "  {} Set {}_API_KEY environment variable for {} provider",
+            "⚠".yellow(),
+            config.provider_name().to_uppercase(),
+            config.provider_name(),
+        );
+        return Ok(HashMap::new());
+    }
 
     eprintln!(
-        "  {} Analyzing {} findings with AI ({})...",
+        "  {} Analyzing {} findings with AI ({} / {})...",
         "🤖".to_string(),
         findings.len(),
-        model
+        config.provider_name(),
+        model,
     );
 
-    let mut file_contents = std::collections::HashMap::new();
+    let mut file_contents = HashMap::new();
     for f in findings.iter() {
         if !file_contents.contains_key(&f.file_path) {
             if let Ok(content) = std::fs::read_to_string(&f.file_path) {
@@ -125,20 +131,28 @@ fn run_ai_analysis(
     }
 
     let rt = tokio::runtime::Runtime::new()?;
-    let analyses = rt.block_on(ai::analyze_findings(findings, &ai_config, &file_contents))?;
+    let analyses = rt.block_on(ai::analyze_findings(findings, &config, &file_contents))?;
 
-    let fp_count = analyses.iter().filter(|(_, a)| a.is_false_positive).count();
+    let fp_count = ai::apply_ai_filter(findings, &analyses);
     if fp_count > 0 {
         eprintln!(
             "  {} AI filtered {} false positive(s)",
             "✓".green(),
-            fp_count
+            fp_count,
         );
     }
 
-    ai::apply_ai_filter(findings, &analyses);
+    let annotations = ai::build_ai_annotations(findings, &analyses);
+    let annotated = annotations.len();
+    if annotated > 0 {
+        eprintln!(
+            "  {} AI annotated {} finding(s) with reasoning & fixes",
+            "✓".green(),
+            annotated,
+        );
+    }
 
-    Ok(())
+    Ok(annotations)
 }
 
 fn print_banner() {

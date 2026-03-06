@@ -49,9 +49,21 @@ pub enum Commands {
         #[arg(long, default_value = "ollama")]
         ai_provider: String,
 
-        /// AI model name
+        /// AI model name (e.g. llama3, gpt-4o, claude-sonnet-4-20250514)
         #[arg(long, default_value = "llama3")]
         ai_model: String,
+
+        /// Custom API base URL (for OpenAI-compatible services, e.g. http://localhost:8080/v1)
+        #[arg(long)]
+        ai_url: Option<String>,
+
+        /// Max concurrent AI requests
+        #[arg(long, default_value = "4")]
+        ai_concurrency: usize,
+
+        /// AI request timeout in seconds
+        #[arg(long, default_value = "30")]
+        ai_timeout: u64,
 
         /// Launch interactive TUI dashboard
         #[arg(long)]

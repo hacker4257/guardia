@@ -18,7 +18,6 @@ use crate::scanner::{Finding, Severity};
 struct App {
     findings: Vec<Finding>,
     selected: usize,
-    scroll_offset: usize,
     show_detail: bool,
     should_quit: bool,
     scan_duration: Duration,
@@ -29,7 +28,6 @@ impl App {
         Self {
             findings,
             selected: 0,
-            scroll_offset: 0,
             show_detail: false,
             should_quit: false,
             scan_duration,

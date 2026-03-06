@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde::Serialize;
+use std::collections::HashMap;
 
+use crate::ai::AiAnalysis;
 use crate::scanner::{Finding, Severity};
 
 #[derive(Serialize)]
@@ -53,6 +55,10 @@ struct SarifResult {
     level: String,
     message: SarifMessage,
     locations: Vec<SarifLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixes: Option<Vec<SarifFix>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    properties: Option<SarifProperties>,
 }
 
 #[derive(Serialize)]
@@ -84,6 +90,19 @@ struct SarifRegion {
     start_line: usize,
 }
 
+#[derive(Serialize)]
+struct SarifFix {
+    description: SarifMessage,
+}
+
+#[derive(Serialize)]
+struct SarifProperties {
+    #[serde(rename = "ai-confidence")]
+    ai_confidence: f32,
+    #[serde(rename = "ai-reasoning")]
+    ai_reasoning: String,
+}
+
 fn severity_to_sarif_level(severity: &Severity) -> &'static str {
     match severity {
         Severity::Critical | Severity::High => "error",
@@ -92,7 +111,10 @@ fn severity_to_sarif_level(severity: &Severity) -> &'static str {
     }
 }
 
-pub fn print_report(findings: &[Finding]) -> Result<()> {
+pub fn print_report(
+    findings: &[Finding],
+    ai_annotations: &HashMap<usize, AiAnalysis>,
+) -> Result<()> {
     let mut seen_rules = std::collections::HashSet::new();
     let mut rules = Vec::new();
 
@@ -125,22 +147,40 @@ pub fn print_report(findings: &[Finding]) -> Result<()> {
             },
             results: findings
                 .iter()
-                .map(|f| SarifResult {
-                    rule_id: f.rule_id.clone(),
-                    level: severity_to_sarif_level(&f.severity).to_string(),
-                    message: SarifMessage {
-                        text: format!("{}: {}", f.title, f.description),
-                    },
-                    locations: vec![SarifLocation {
-                        physical_location: SarifPhysicalLocation {
-                            artifact_location: SarifArtifactLocation {
-                                uri: f.file_path.display().to_string().replace('\\', "/"),
-                            },
-                            region: SarifRegion {
-                                start_line: f.line_number,
-                            },
+                .enumerate()
+                .map(|(i, f)| {
+                    let ai = ai_annotations.get(&i);
+
+                    let fixes = ai
+                        .and_then(|a| a.suggested_fix.as_ref())
+                        .map(|fix| vec![SarifFix {
+                            description: SarifMessage { text: fix.clone() },
+                        }]);
+
+                    let properties = ai.map(|a| SarifProperties {
+                        ai_confidence: a.confidence,
+                        ai_reasoning: a.reasoning.clone(),
+                    });
+
+                    SarifResult {
+                        rule_id: f.rule_id.clone(),
+                        level: severity_to_sarif_level(&f.severity).to_string(),
+                        message: SarifMessage {
+                            text: format!("{}: {}", f.title, f.description),
                         },
-                    }],
+                        locations: vec![SarifLocation {
+                            physical_location: SarifPhysicalLocation {
+                                artifact_location: SarifArtifactLocation {
+                                    uri: f.file_path.display().to_string().replace('\\', "/"),
+                                },
+                                region: SarifRegion {
+                                    start_line: f.line_number,
+                                },
+                            },
+                        }],
+                        fixes,
+                        properties,
+                    }
                 })
                 .collect(),
         }],

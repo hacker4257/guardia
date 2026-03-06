@@ -41,6 +41,3 @@ pub fn scan_ast(file_path: &PathBuf, content: &str, findings: &mut Vec<Finding>)
     taint.analyze(&root, source, file_path, findings);
 }
 
-pub fn supported_extensions() -> &'static [&'static str] {
-    &["py", "js", "ts", "jsx", "tsx", "java", "go", "rs"]
-}
