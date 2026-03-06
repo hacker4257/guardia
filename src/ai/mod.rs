@@ -363,7 +363,67 @@ async fn call_anthropic(client: &reqwest::Client, config: &AiConfig, prompt: &st
 
 // ── Response parsing ──
 
+#[derive(Deserialize)]
+struct RawJsonResponse {
+    false_positive: Option<bool>,
+    confidence: Option<f32>,
+    reasoning: Option<String>,
+    suggested_fix: Option<String>,
+    #[allow(dead_code)]
+    fix_description: Option<String>,
+}
+
 fn parse_ai_response(text: &str) -> AiAnalysis {
+    if let Some(analysis) = try_parse_json(text) {
+        return analysis;
+    }
+    parse_text_fallback(text)
+}
+
+fn try_parse_json(text: &str) -> Option<AiAnalysis> {
+    let json_str = extract_json_object(text)?;
+    let raw: RawJsonResponse = serde_json::from_str(&json_str).ok()?;
+
+    Some(AiAnalysis {
+        is_false_positive: raw.false_positive.unwrap_or(false),
+        confidence: raw.confidence.unwrap_or(0.5).clamp(0.0, 1.0),
+        reasoning: raw.reasoning
+            .unwrap_or_default()
+            .chars()
+            .take(500)
+            .collect(),
+        suggested_fix: raw.suggested_fix.filter(|s| !s.is_empty()),
+    })
+}
+
+fn extract_json_object(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let mut depth = 0;
+    let mut in_string = false;
+    let mut escape_next = false;
+
+    for (i, ch) in text[start..].char_indices() {
+        if escape_next {
+            escape_next = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_string => escape_next = true,
+            '"' => in_string = !in_string,
+            '{' if !in_string => depth += 1,
+            '}' if !in_string => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(text[start..start + i + 1].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_text_fallback(text: &str) -> AiAnalysis {
     let lower = text.to_lowercase();
 
     let is_false_positive = lower.contains("false_positive: true")
@@ -372,30 +432,54 @@ fn parse_ai_response(text: &str) -> AiAnalysis {
         || lower.contains("is_false_positive: true")
         || (lower.contains("this is a false positive") && !lower.contains("not a false positive"));
 
-    let confidence = if lower.contains("confidence: high") || lower.contains("confidence: 0.9") {
-        0.9
-    } else if lower.contains("confidence: medium") || lower.contains("confidence: 0.7") || lower.contains("confidence: 0.6") {
-        0.7
-    } else if lower.contains("confidence: low") || lower.contains("confidence: 0.3") {
-        0.3
-    } else {
-        0.5
-    };
+    let confidence = extract_confidence_number(&lower)
+        .unwrap_or_else(|| {
+            if lower.contains("confidence: high") || lower.contains("high confidence") {
+                0.9
+            } else if lower.contains("confidence: medium") || lower.contains("medium confidence") {
+                0.7
+            } else if lower.contains("confidence: low") || lower.contains("low confidence") {
+                0.3
+            } else {
+                0.5
+            }
+        });
 
     let reasoning = extract_field(text, "REASONING:")
-        .unwrap_or_else(|| text.lines().take(3).collect::<Vec<_>>().join(" "))
+        .or_else(|| extract_field(text, "reasoning:"))
+        .unwrap_or_else(|| text.lines()
+            .filter(|l| !l.trim().is_empty())
+            .take(3)
+            .collect::<Vec<_>>()
+            .join(" "))
         .chars()
-        .take(300)
+        .take(500)
         .collect();
 
     let suggested_fix = extract_code_block(text);
 
     AiAnalysis {
         is_false_positive,
-        confidence,
+        confidence: confidence.clamp(0.0, 1.0),
         reasoning,
         suggested_fix,
     }
+}
+
+fn extract_confidence_number(text: &str) -> Option<f32> {
+    let patterns = ["confidence: ", "confidence\":", "\"confidence\":"];
+    for pat in &patterns {
+        if let Some(pos) = text.find(pat) {
+            let after = &text[pos + pat.len()..];
+            let num_str: String = after.trim().chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if let Ok(val) = num_str.parse::<f32>() {
+                return Some(if val > 1.0 { val / 100.0 } else { val });
+            }
+        }
+    }
+    None
 }
 
 fn extract_field(text: &str, field: &str) -> Option<String> {
@@ -425,8 +509,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_true_positive() {
-        let resp = "FALSE_POSITIVE: false\nCONFIDENCE: high\nREASONING: This is a real SQL injection.\nSUGGESTED_FIX:\n```python\ncursor.execute('SELECT * FROM users WHERE id = ?', (uid,))\n```";
+    fn test_parse_json_true_positive() {
+        let resp = r#"{"false_positive": false, "confidence": 0.9, "reasoning": "This is a real SQL injection vulnerability.", "suggested_fix": "cursor.execute('SELECT * FROM users WHERE id = ?', (uid,))"}"#;
         let analysis = parse_ai_response(resp);
         assert!(!analysis.is_false_positive);
         assert!(analysis.confidence > 0.8);
@@ -435,7 +519,33 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_false_positive() {
+    fn test_parse_json_false_positive() {
+        let resp = r#"{"false_positive": true, "confidence": 0.95, "reasoning": "This is AWS's example key AKIAIOSFODNN7EXAMPLE, not a real credential.", "suggested_fix": null}"#;
+        let analysis = parse_ai_response(resp);
+        assert!(analysis.is_false_positive);
+        assert!(analysis.confidence > 0.9);
+        assert!(analysis.suggested_fix.is_none());
+    }
+
+    #[test]
+    fn test_parse_json_with_markdown_wrapper() {
+        let resp = "Sure, here's my analysis:\n\n```json\n{\"false_positive\": false, \"confidence\": 0.85, \"reasoning\": \"Command injection via os.system\", \"suggested_fix\": \"subprocess.run(cmd, shell=False)\"}\n```\n";
+        let analysis = parse_ai_response(resp);
+        assert!(!analysis.is_false_positive);
+        assert!(analysis.confidence > 0.8);
+    }
+
+    #[test]
+    fn test_parse_text_fallback_true_positive() {
+        let resp = "FALSE_POSITIVE: false\nCONFIDENCE: high\nREASONING: This is a real SQL injection.\nSUGGESTED_FIX:\n```python\ncursor.execute('SELECT * FROM users WHERE id = ?', (uid,))\n```";
+        let analysis = parse_ai_response(resp);
+        assert!(!analysis.is_false_positive);
+        assert!(analysis.confidence > 0.8);
+        assert!(analysis.suggested_fix.is_some());
+    }
+
+    #[test]
+    fn test_parse_text_fallback_false_positive() {
         let resp = "FALSE_POSITIVE: true\nCONFIDENCE: high\nREASONING: This is a test file with example data, not a real secret.";
         let analysis = parse_ai_response(resp);
         assert!(analysis.is_false_positive);
@@ -448,6 +558,28 @@ mod tests {
         let analysis = parse_ai_response(resp);
         assert!(analysis.confidence >= 0.5);
         assert!(!analysis.reasoning.is_empty());
+    }
+
+    #[test]
+    fn test_parse_numeric_confidence() {
+        let resp = r#"{"false_positive": false, "confidence": 0.73, "reasoning": "Moderate risk.", "suggested_fix": null}"#;
+        let analysis = parse_ai_response(resp);
+        assert!((analysis.confidence - 0.73).abs() < 0.01);
+    }
+
+    #[test]
+    fn test_confidence_clamped() {
+        let resp = r#"{"false_positive": false, "confidence": 1.5, "reasoning": "Over-confident.", "suggested_fix": null}"#;
+        let analysis = parse_ai_response(resp);
+        assert!(analysis.confidence <= 1.0);
+    }
+
+    #[test]
+    fn test_extract_json_nested() {
+        let json = r#"blah {"false_positive": true, "reasoning": "has \"quotes\" inside"} blah"#;
+        let extracted = extract_json_object(json);
+        assert!(extracted.is_some());
+        assert!(extracted.unwrap().starts_with('{'));
     }
 
     #[test]
